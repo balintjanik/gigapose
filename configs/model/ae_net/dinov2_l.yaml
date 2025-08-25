@@ -6,5 +6,5 @@ dinov2_model:
   repo_or_dir: facebookresearch/dinov2
   model: ${model.ae_net.model_name}
 
-max_batch_size: 64
+max_batch_size: 2
 descriptor_size: 1024

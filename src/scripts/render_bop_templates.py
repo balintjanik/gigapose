@@ -92,7 +92,11 @@ def render(cfg) -> None:
             cad_name = "models_cad"
         else:
             cad_name = "models"
-        cad_dir = root_dir / dataset_name / cad_name
+        
+        # edit by vavsaai
+        cad_dir = (root_dir / dataset_name / cad_name).resolve()   # edit by vavsaai: resolve() makes it absolute path (fixes an issue)
+        #N_WORKERS = 1   # for debug
+        #cfg.machine.num_workers = N_WORKERS
 
         cad_paths = cad_dir.glob("*.ply")
         cad_paths = list(cad_paths)

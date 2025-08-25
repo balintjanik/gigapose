@@ -74,9 +74,9 @@ def download(cfg: DictConfig) -> None:
             prefix = "_primesense"
         else:
             prefix = ""
-        rgb_url = f"{cfg_data.source_url}/{dataset_name}_test{prefix}_bop19.zip"
-        cad_url = f"{cfg_data.source_url}/{dataset_name}_models.zip"
-        base_url = f"{cfg_data.source_url}/{dataset_name}_base.zip"
+        rgb_url = os.path.join(cfg_data.source_url, f"{dataset_name}/resolve/main/{dataset_name}_test{prefix}_bop19.zip")    # edit by vavsaai
+        cad_url = os.path.join(cfg_data.source_url, f"{dataset_name}/resolve/main/{dataset_name}_models.zip")                # edit by vavsaai
+        base_url = os.path.join(cfg_data.source_url, f"{dataset_name}/resolve/main/{dataset_name}_base.zip")                 # edit by vavsaai
         cfg_dataset = OmegaConf.create(
             {
                 "name": dataset_name,

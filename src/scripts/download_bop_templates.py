@@ -22,7 +22,7 @@ def download(cfg: DictConfig) -> None:
 
     download_cmd = f"wget -O {tmp_dir}/templates.zip {source_url}"
     logger.info(f"Running {download_cmd}")
-    # os.system(download_cmd)
+    os.system(download_cmd)
 
     unzip_cmd = f"unzip {tmp_dir}/templates.zip -d {tmp_dir}"
     logger.info(f"Running {unzip_cmd}")

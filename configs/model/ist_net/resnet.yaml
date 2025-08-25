@@ -19,7 +19,7 @@ regressor:
   use_tanh_act: true
   normalize_output: true
 
-max_batch_size: 64
+max_batch_size: 2
 
 pretrained_weights: 
 checkpoint_key: state_dict

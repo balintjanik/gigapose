@@ -6,8 +6,8 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - pip
-  - python=3.9.6
+  - pip<24.1
+  - python=3.9
   - pip:
     - torch
     - torchvision
