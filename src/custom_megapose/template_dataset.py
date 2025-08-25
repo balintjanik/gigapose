@@ -35,6 +35,7 @@ class TemplateData:
     label: str
     template_dir: str
     num_templates: int
+    total_templates: int
     TWO_init: Transform
     pose_path: Optional[str] = None
     unique_id: Optional[int] = None
@@ -49,6 +50,7 @@ class TemplateData:
             template_dir=str(template_gt["template_dir"]),
             pose_path=str(template_gt["pose_path"]),
             num_templates=int(template_gt["num_templates"]),
+            total_templates=int(template_gt["total_templates"]),
             TWO_init=ScaleTransform(scale_factor=template_gt["scale_factor"]),
         )
         return data
@@ -178,7 +180,8 @@ class TemplateData:
     def read_test_mode(
         self,
     ):
-        data = self.load_set_of_templates(view_ids=np.arange(0, self.num_templates))
+        view_ids = np.linspace(0, self.total_templates - 1, self.num_templates, dtype=int)
+        data = self.load_set_of_templates(view_ids=view_ids)
         poses = self.load_pose()
         return data, poses
 
@@ -231,6 +234,7 @@ class TemplateDataset:
             obj_id = model_info["obj_id"]
             template_metaData = {"label": str(obj_id)}
             template_metaData["num_templates"] = config.num_templates
+            template_metaData["total_templates"] = config.total_templates
             template_metaData["template_dir"] = os.path.join(
                 config.dir, f"{obj_id:06d}"
             )
