@@ -1,3 +1,6 @@
+# Custom
+gigaPose_datasets/
+
 # Additional
 configs/user/nguyen.yaml
 slurm_logs/
