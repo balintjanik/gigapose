@@ -361,6 +361,9 @@ class GigaPose(pl.LightningModule):
         names = ["rgb", "mask", "K", "M", "poses", "ae_features", "ist_features"]
         template_data = {name: BatchedData(None) for name in names}
 
+        self.ae_net.eval()
+        self.ist_net.eval()
+
         for idx in tqdm(range(len(template_dataset))):
             for name in names:
                 if name in ["ae_features", "ist_features"]:
@@ -368,18 +371,33 @@ class GigaPose(pl.LightningModule):
                 if name == "rgb":
                     templates = template_dataset[idx].rgb.to(self.device)
                     if self.max_num_dets_per_forward is None:
-                        template_data[name].append(templates)
+                        template_data[name].append(templates.detach().cpu())
+                    
+                    with torch.inference_mode():
+                        # chunk ae_net
+                        B = templates.shape[0]
+                        bs = min(8, B)
+                        ae_chunks = []
+                        for s in range(0, B, bs):
+                            out = self.ae_net(templates[s:s+bs])
+                            ae_chunks.append(out.detach().cpu())
+                        ae_features = torch.cat(ae_chunks, dim=0)
+                        template_data["ae_features"].append(ae_features)
 
-                    ae_features = self.ae_net(templates)
-                    template_data["ae_features"].append(ae_features)
+                        ist_features = self.ist_net.forward_by_chunk(templates).detach().cpu()
+                        template_data["ist_features"].append(ist_features)
+                    
+                    del templates, ae_features, ist_features
 
-                    ist_features = self.ist_net.forward_by_chunk(templates)
-                    template_data["ist_features"].append(ist_features)
                 else:
                     tmp = getattr(template_dataset[idx], name)
-                    template_data[name].append(tmp.to(self.device))
+                    template_data[name].append(tmp.detach().cpu())
+                
+                torch.cuda.empty_cache()
+        
         if self.max_num_dets_per_forward is not None:
             names.remove("rgb")
+
         for name in names:
             template_data[name].stack()
             template_data[name] = template_data[name].data
@@ -387,11 +405,13 @@ class GigaPose(pl.LightningModule):
         self.template_datas[dataset_name] = tc.PandasTensorCollection(
             infos=pd.DataFrame(), **template_data
         )
+
         self.pose_recovery[dataset_name] = ObjectPoseRecovery(
             template_K=template_data["K"],
             template_Ms=template_data["M"],
             template_poses=template_data["poses"],
         )
+
         num_obj = len(template_data["K"])
         onboarding_time = self.timer.toc() / num_obj
         self.timer.reset()
@@ -497,6 +517,10 @@ class GigaPose(pl.LightningModule):
         B, C, H, W = batch.tar_img.shape
         device = batch.tar_img.device
 
+        labels_all = torch.as_tensor(
+            np.asarray(batch.infos.label).astype(np.int32)
+        )
+
         # if low_memory_mode, two detections are forward at a time
         list_idx_sample = []
         if self.max_num_dets_per_forward is not None:
@@ -511,10 +535,7 @@ class GigaPose(pl.LightningModule):
         for idx_sub_batch, idx_sample in enumerate(list_idx_sample):
             # compute target features
             tar_ae_features = self.ae_net(batch.tar_img[idx_sample])
-            tar_label_np = np.asarray(
-                batch.infos.label[idx_sample.cpu().numpy()]
-            ).astype(np.int32)
-            tar_label = torch.from_numpy(tar_label_np).to(device)
+            tar_label = labels_all[idx_sample.cpu()]
 
             # template data
             src_ae_features = template_data.ae_features[tar_label - 1]
@@ -534,6 +555,9 @@ class GigaPose(pl.LightningModule):
                 predictions = predictions_
             else:
                 predictions.cat_df(predictions_)
+            
+            del tar_ae_features, tar_label
+            torch.cuda.empty_cache()
 
         # Step 2: Find affine transforms
         num_patches = predictions.src_pts.shape[2]
@@ -541,44 +565,47 @@ class GigaPose(pl.LightningModule):
         pred_scales = torch.zeros(B, k, num_patches, device=device)
         pred_cosSin_inplanes = torch.zeros(B, k, num_patches, 2, device=device)
 
+        bs = self.max_num_dets_per_forward or 4 # chunk size over detections
+
         self.timer.tic()
-        for idx_k in range(k):
-            idx_sample = torch.arange(0, B, device=device)
-            idx_views = [idx_sample, predictions.id_src[:, idx_k]]
+        with torch.inference_mode():
+            for idx_k in range(k):
+                for start in range(0, B, bs):
+                    end = min(start + bs, B)
+                    idx_sample_chunk = slice(start, end)
+                    idx_views_chunk = predictions.id_src[idx_sample_chunk, idx_k]
 
-            tar_label_np = np.asarray(batch.infos.label).astype(np.int32)
-            tar_label = torch.from_numpy(tar_label_np).to(device)
+                    rows_feat_gpu = template_data.ist_features[labels_all[start:end] - 1].to(device, non_blocking=True)
 
-            src_ist_features = template_data.ist_features[tar_label - 1]
-            tar_ist_features = self.ist_net.forward_by_chunk(batch.tar_img[idx_sample])
+                    src_ist_features_chunk = rows_feat_gpu[torch.arange(end - start, device=device), idx_views_chunk]
+                    tar_ist_features_chunk = self.ist_net.forward_by_chunk(batch.tar_img[idx_sample_chunk])
 
-            if self.max_num_dets_per_forward is not None:
-                (
-                    pred_scales[:, idx_k],
-                    pred_cosSin_inplanes[:, idx_k],
-                ) = self.ist_net.inference_by_chunk(
-                    src_feat=src_ist_features[idx_views],
-                    tar_feat=tar_ist_features,
-                    src_pts=predictions.src_pts[:, idx_k],
-                    tar_pts=predictions.tar_pts[:, idx_k],
-                    max_batch_size=self.max_num_dets_per_forward,
-                )
-            else:
-                (
-                    pred_scales[:, idx_k],
-                    pred_cosSin_inplanes[:, idx_k],
-                ) = self.ist_net.inference(
-                    src_feat=src_ist_features[idx_views],
-                    tar_feat=tar_ist_features,
-                    src_pts=predictions.src_pts[:, idx_k],
-                    tar_pts=predictions.tar_pts[:, idx_k],
-                )
+                    if self.max_num_dets_per_forward is not None:
+                        pred_scales_batch, pred_cosSin_inplanes_batch = self.ist_net.inference_by_chunk(
+                            src_feat=src_ist_features_chunk,
+                            tar_feat=tar_ist_features_chunk,
+                            src_pts=predictions.src_pts[idx_sample_chunk, idx_k],
+                            tar_pts=predictions.tar_pts[idx_sample_chunk, idx_k],
+                            max_batch_size=self.max_num_dets_per_forward,
+                        )
+                    else:
+                        pred_scales_batch, pred_cosSin_inplanes_batch = self.ist_net.inference(
+                            src_feat=src_ist_features_chunk,
+                            tar_feat=tar_ist_features_chunk,
+                            src_pts=predictions.src_pts[idx_sample_chunk, idx_k],
+                            tar_pts=predictions.tar_pts[idx_sample_chunk, idx_k],
+                        )
+                    
+                    # write back to preallocated buffers
+                    pred_scales[idx_sample_chunk, idx_k] = pred_scales_batch
+                    pred_cosSin_inplanes[idx_sample_chunk, idx_k] = pred_cosSin_inplanes_batch
+
+                    # free per-chunk temporaries
+                    del rows_feat_gpu, src_ist_features_chunk, idx_views_chunk, tar_ist_features_chunk
+                    torch.cuda.empty_cache()
 
         predictions.register_tensor("relScale", pred_scales)
-        predictions.register_tensor(
-            "relInplane",
-            pred_cosSin_inplanes,
-        )
+        predictions.register_tensor("relInplane", pred_cosSin_inplanes)
         times["neighbor_search"] = self.timer.toc()
         self.timer.reset()
 
@@ -589,20 +616,21 @@ class GigaPose(pl.LightningModule):
         predictions.register_tensor("scores", score)
         if sort_pred_by_inliers:
             order = torch.argsort(score, dim=1, descending=True)
+            rows = torch.arange(order.size(0), device=order.device)[:, None]
             for k, v in predictions._tensors.items():
                 if k in ["infos", "meta"]:
                     continue
-                predictions.register_tensor(k, v[idx_sample[:, None], order])
-
+                predictions.register_tensor(k, v[rows, order])
         # calculate prediction
         pred_poses = self.pose_recovery[dataset_name].forward_recovery(
-            tar_label=tar_label,
+            tar_label=labels_all,
             tar_K=batch.tar_K,
             tar_M=batch.tar_M,
             pred_src_views=predictions.id_src,
             pred_M=predictions.M.clone(),
         )
         predictions.register_tensor("pred_poses", pred_poses)
+        del labels_all
 
         times["final_step"] = self.timer.toc()
         self.timer.reset()

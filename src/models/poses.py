@@ -108,9 +108,9 @@ class ObjectPoseRecovery(torch.nn.Module):
         pred_src_views,
         pred_M,
     ):
-        template_poses = self.template_poses.clone()[tar_label - 1]
-        template_Ms = self.template_Ms.clone()[tar_label - 1]
-        template_K = self.template_K.clone()[tar_label - 1]
+        template_poses = self.template_poses.clone()[tar_label - 1].to(pred_M.device, non_blocking=True)
+        template_Ms = self.template_Ms.clone()[tar_label - 1].to(pred_M.device, non_blocking=True)
+        template_K = self.template_K.clone()[tar_label - 1].to(pred_M.device, non_blocking=True)
         return self._forward_recovery(
             query_M=tar_M,
             query_K=tar_K,

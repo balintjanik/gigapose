@@ -210,65 +210,92 @@ class LocalSimilarity(torch.nn.Module):
         out_data = {name: BatchedData(None) for name in out_names}
 
         for idx in range(len(in_data["src_feats"])):
-            src_feats = in_data["src_feats"][idx]
-            tar_feat = in_data["tar_feat"][idx]
-            src_masks = in_data["src_masks"][idx]
-            tar_mask = in_data["tar_mask"][idx]
+            src_feats_cpu = in_data["src_feats"][idx]
+            tar_feat_cpu = in_data["tar_feat"][idx]
+            src_masks_cpu = in_data["src_masks"][idx]
+            tar_mask_cpu = in_data["tar_mask"][idx]
 
-            B, N = src_masks.shape[:2]
-            device = src_masks.device
+            B, N = src_masks_cpu.shape[:2]
+            device = "cuda"
             feat_size = (self.num_patches, self.num_patches)
 
-            tar_mask = F.interpolate(tar_mask.unsqueeze(1), size=feat_size)
+            tar_mask = F.interpolate(tar_mask_cpu.unsqueeze(1), size=feat_size).to(device)
             tar_mask = rearrange(tar_mask, "b 1 h w -> b (h w)")
-            tar_feat = F.normalize(tar_feat, dim=1)
+            tar_feat = F.normalize(tar_feat_cpu.to(device), dim=1)
             tar_feat = rearrange(tar_feat, "b c h w -> b c (h w)")
 
-            src_masks = F.interpolate(src_masks, size=feat_size)
-            src_masks = rearrange(src_masks, "b n h w -> b n (h w)")
-            src_feats = F.normalize(src_feats, dim=2)
-            src_feats = rearrange(src_feats, "b n c h w -> b n c (h w)")
+            n_chunk = getattr(self, "n_views_chunk", 8)
 
-            # Step 1: Find nearest neighbor for each patch of query image
-            sim = torch.einsum("b c t, b n c s -> b n t s", tar_feat, src_feats)
-            sim *= src_masks[:, :, None, :]
-            sim *= tar_mask[:, None, :, None]
-            sim[sim < self.sim_threshold] = 0
+            all_score_tar2src = []
+            all_idx_tar2src   = []
+            all_mask_all      = []
 
-            # Find nearest neighbor for each patch of query image
-            if self.search_direction == "tar2src":
-                score_tar2src, idx_tar2src = torch.max(sim, dim=3)  # b x n x t
-                score_src2tar, idx_src2tar = torch.max(sim, dim=2)  # b x n x s
-            elif self.search_direction == "src2tar":
-                score_tar2src, idx_tar2src = torch.max(sim, dim=2)  # b x n x s
-                score_src2tar, idx_src2tar = torch.max(sim, dim=3)  # b x n x t
+            # Chunk over the N (template/view) dimension
+            for start in range(0, N, n_chunk):
+                end = min(start + n_chunk, N)
 
-            # Filter out the slow score matching
-            mask_sim = score_tar2src >= self.sim_threshold
+                # move just the chunk to device
+                with torch.no_grad():
+                    src_feats = src_feats_cpu[:, start:end].to(device, non_blocking=True)
+                    src_masks = src_masks_cpu[:, start:end].to(device, non_blocking=True)
 
-            # Find consistency patches (source -> target -> source)
-            if self.patch_threshold > 0:
-                mask_cycle = self.find_consistency_patches(
-                    sim_src2tar=score_src2tar,
-                    idx_src2tar=idx_src2tar,
-                    idx_tar2src=idx_tar2src,
-                )
-            else:
-                mask_cycle = torch.ones_like(mask_sim)
+                    # prepare masks/features for this chunk
+                    src_masks = F.interpolate(src_masks, size=feat_size)
+                    src_masks = rearrange(src_masks, "b n h w -> b n (h w)")
 
-            # Find valid patches has mask in both source and target
-            tar_masks = repeat(tar_mask, "b t -> b n t", n=N)
-            mask_tar2src = torch.gather(src_masks, 2, idx_tar2src)
+                    src_feats = F.normalize(src_feats, dim=2)
+                    src_feats = rearrange(src_feats, "b n c h w -> b n c (h w)")
 
-            mask_non_zero = (
-                tar_masks  # mask of query = 0
-                * mask_tar2src  # mask of template = 0
-                * (idx_src2tar != 0)  # sim = 0
-                * (idx_tar2src != 0)  # sim = 0
-            )
+                    # Step 1: Find nearest neighbor for each patch of query image
+                    sim = torch.einsum("b c t, b n c s -> b n t s", tar_feat, src_feats)
+                    sim *= src_masks[:, :, None, :]
+                    sim *= tar_mask[:, None, :, None]
+                    sim[sim < self.sim_threshold] = 0
 
-            # Combine all masks
-            mask_all = mask_sim * mask_cycle * mask_non_zero  # b x t
+                    # Find nearest neighbor for each patch of query image
+                    if self.search_direction == "tar2src":
+                        score_tar2src, idx_tar2src = torch.max(sim, dim=3)
+                        score_src2tar, idx_src2tar = torch.max(sim, dim=2)
+                    elif self.search_direction == "src2tar":
+                        score_tar2src, idx_tar2src = torch.max(sim, dim=2)
+                        score_src2tar, idx_src2tar = torch.max(sim, dim=3)
+
+                    # Filter out the slow score matching
+                    mask_sim = score_tar2src >= self.sim_threshold
+                    
+                    # Find consistency patches (source -> target -> source)
+                    if self.patch_threshold > 0:
+                        mask_cycle = self.find_consistency_patches(
+                            sim_src2tar=score_src2tar,
+                            idx_src2tar=idx_src2tar,
+                            idx_tar2src=idx_tar2src,
+                        )
+                    else:
+                        mask_cycle = torch.ones_like(mask_sim, dtype=torch.bool)
+
+                    # Find valid patches has mask in both source and target
+                    tar_masks_rep   = repeat(tar_mask, "b t -> b n t", n=end - start)
+                    mask_tar2src    = torch.gather(src_masks, 2, idx_tar2src)
+
+                    mask_non_zero = (
+                        tar_masks_rep # mask of query = 0
+                        * mask_tar2src # mask of template = 0
+                        * (idx_src2tar != 0) # sim = 0
+                        * (idx_tar2src != 0) # sim = 0
+                    ).bool()
+
+                    # Combine all masks
+                    mask_all = mask_sim & mask_cycle & mask_non_zero # b x t
+
+                    all_score_tar2src.append(score_tar2src)
+                    all_idx_tar2src.append(idx_tar2src)
+                    all_mask_all.append(mask_all)
+
+                    del src_feats, src_masks, sim, score_src2tar, idx_src2tar
+
+            score_tar2src = torch.cat(all_score_tar2src, dim=1)
+            idx_tar2src   = torch.cat(all_idx_tar2src,   dim=1)
+            mask_all      = torch.cat(all_mask_all,      dim=1)
 
             # Step 2: Find best template for each target
             mask = mask_all.sum(dim=2) > 0
